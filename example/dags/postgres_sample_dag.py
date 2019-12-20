@@ -156,6 +156,117 @@ def create_es_publisher_sample_job():
     job.launch()
 
 
+class SQLParser:
+    join_keywords = {
+        "join",
+        "full join",
+        "cross join",
+        "inner join",
+        "left join",
+        "right join",
+        "full outer join",
+        "right outer join",
+        "left outer join",
+    }
+
+    def get_join_data_from_query(self, query):
+        # TODO handle cases where there are multiple queries with union (only last query will be picked up)
+        # TODO handle cases where comments mess up the queries (when they don't have newlines)
+        # TODO handle cases where queries are not selects (not sure if needed ???)
+        # TODO handle cases where queries are nested inside each other
+
+        idx = 0
+
+        joined_tables = []
+        source_table = ""
+        join_type = ""
+
+        from_flag = False
+        join_flag = False
+
+        formatted = sqlparse.format(query, strip_comments=True)
+        parsed = sqlparse.parse(formatted)[0]
+
+        # iterate through tokens to find out source table name and joined tables
+        while True:
+            idx, token = parsed.token_next(idx, skip_ws=True, skip_cm=True)
+            if token is None:
+                break
+
+            if from_flag:
+                try:
+                    source_table = {"schema": token.get_parent_name(), "table": token.get_real_name()}
+                except Exception:
+                    print("FAILED. QUERY: {}".format(query))
+                from_flag = False
+
+            if join_flag:
+                join_table = {"schema": token.get_parent_name(), "table": token.get_real_name(), "join_type": join_type}
+                joined_tables.append(join_table)
+                join_flag = False
+
+            token_val = token.value.lower()
+            if token_val == "from":
+                from_flag = True
+            elif token_val in self.join_keywords:
+                join_type = token_val
+                join_flag = True
+
+        return source_table, joined_tables
+
+
+def populate_join_data(tx, source_table_name, dest_table_name):
+    # Check if data already exists
+    result = tx.run("""
+        MATCH (t1: Table)-[r:JOINED_BY]->(t2: Table)
+        WHERE t1.name=$source_table_name and t2.name=$dest_table_name
+        RETURN t1
+    """, source_table_name=source_table_name, dest_table_name=dest_table_name)
+
+    # If exists just increase graph weight
+    if result.peek():
+        tx.run("""
+        MATCH (t1: Table)-[r1:JOINED_BY]->(t2: Table), (t2: Table)-[r2:JOINS]->(t1: Table)
+        WHERE t1.name=$source_table_name and t2.name=$dest_table_name
+        SET r1.join_count = r1.join_count + 1
+        SET r2.join_count = r2.join_count + 1
+        """, source_table_name=source_table_name, dest_table_name=dest_table_name)
+    # Else create new relation
+    else:
+        tx.run("""
+            MATCH (t1:Table), (t2: Table)
+            WHERE t1.name=$source_table_name and t2.name=$dest_table_name
+            CREATE (t1)-[r:JOINED_BY {join_count: $join_count}]->(t2)
+            CREATE (t2)-[r1:JOINS {join_count: $join_count}]->(t1)
+            """, source_table_name=source_table_name, dest_table_name=dest_table_name, join_count=1)
+
+
+def get_join_data_from_redshift_and_update():
+    QUERY_LOG_STATEMENT = """
+    select query, trim(querytxt) as sqlquery
+    from stl_query;
+    
+    
+    """
+
+    parser = SQLParser()
+
+    with cursor() as cur:
+        cur.execute(QUERY_LOG_STATEMENT)
+        result = cur.fetchall()
+        for row in result:
+            _, query_text = row
+            if (query_text.startswith("select") or query_text.startswith("SELECT")) and ("join" in query_text or "JOIN" in query_text):
+                source_table, joined_tables = parser.get_join_data_from_query(query_text)
+                print("Source Table: {}".format(source_table))
+                for join_table in joined_tables:
+                    print("Joined Table: {}".format(join_table))
+                    if source_table and joined_tables:
+                        with driver.session() as session:
+                            session.write_transaction(populate_join_data, source_table['table'], join_table['table'])
+
+
+
 with DAG('amundsen_databuilder', default_args=default_args, **dag_args) as dag:
 
     create_table_extract_job = PythonOperator(
